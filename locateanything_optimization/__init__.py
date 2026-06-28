@@ -41,7 +41,19 @@ investigation (profiler, root-cause, the reshape-bug postmortem) and ``benchmark
 reproducible scripts.
 """
 
-from .vision import install_packed_sdpa, packed_sdpa_attention
+from .vision import (
+    compile_vision,
+    install_packed_sdpa,
+    install_real_rope,
+    packed_sdpa_attention,
+    real_apply_rope,
+)
 
-__all__ = ["install_packed_sdpa", "packed_sdpa_attention"]
-__version__ = "0.1.0"
+__all__ = [
+    "install_packed_sdpa",
+    "packed_sdpa_attention",
+    "install_real_rope",
+    "real_apply_rope",
+    "compile_vision",
+]
+__version__ = "0.2.0"

@@ -111,3 +111,68 @@ def install_packed_sdpa(model: torch.nn.Module) -> Callable[[], None]:
         table["sdpa"] = original
 
     return restore
+
+
+def real_apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
+    """Real-valued form of MoonViT's ``apply_rope``: the SAME complex rotation
+    ``(a+jb)*(cos+j*sin) = (a*cos-b*sin) + j(a*sin+b*cos)``, expressed without
+    ``view_as_complex`` / ``view_as_real`` / a complex multiply so the vision encoder becomes
+    ``torch.compile``-able. The stock complex rope crashes Inductor with
+    ``PendingUnbackedSymbolNotFound`` on ``complex64``.
+
+    Per-op drift vs the complex path is bf16-ULP scale (~7e-3, within the packed-SDPA
+    acceptance band ~1.6e-2); on crowd scenes the regression stays identical (the 1.jpg crowd
+    count stays 13). Used only when compiling the vision encoder.
+    """
+    fc = freqs_cis.unsqueeze(-2)  # (..., 1, head_dim/2)
+    cos, sin = fc.real, fc.imag
+
+    def _rot(x):
+        x = x.float().view(*x.shape[:-1], -1, 2)
+        xe, xo = x[..., 0], x[..., 1]
+        return torch.stack((xe * cos - xo * sin, xe * sin + xo * cos), dim=-1).flatten(-2)
+
+    return _rot(xq).type_as(xq), _rot(xk).type_as(xk)
+
+
+def install_real_rope(model: torch.nn.Module) -> Callable[[], None]:
+    """Swap MoonViT's complex ``apply_rope`` for :func:`real_apply_rope` so the vision encoder
+    is ``torch.compile``-able. The module global ``apply_rope`` is the sole call site
+    (``attention_qkvpacked -> apply_rope``), so replacing the global is sufficient. Returns a
+    ``restore()`` callable that reverts to the original complex rope. Call before
+    :func:`compile_vision`.
+    """
+    vm = model.vision_model
+    mod = importlib.import_module(type(vm).__module__)
+    original = getattr(mod, "apply_rope", None)
+    if original is None:
+        raise ValueError(f"{mod.__name__} has no apply_rope; is this a LocateAnything-3B MoonViT?")
+    mod.apply_rope = real_apply_rope
+
+    def restore() -> None:
+        mod.apply_rope = original
+
+    return restore
+
+
+def compile_vision(model: torch.nn.Module) -> None:
+    """``torch.compile`` MoonViT's ``vision_model.forward`` (dynamic shapes).
+
+    Requires :func:`install_real_rope` first (the complex rope crashes Inductor). Fuses the
+    residual / layernorm / rope elementwise; measured ~1.2x vision on Ampere once packed SDPA
+    has already removed the softmax-mask bottleneck (the remaining vision time is GEMM/SDPA/
+    elementwise-balanced, so the win is the elementwise fusion). The first encode pays the
+    ~40s compile cost, so call it during warmup rather than on the first real request. No-op
+    with a warning if ``triton`` is unavailable (Inductor needs it on GPU).
+    """
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        import warnings
+
+        warnings.warn("compile_vision: triton unavailable; vision stays eager.")
+        return
+    vm = model.vision_model
+    if not getattr(vm, "_la_vision_compiled", False):
+        vm.forward = torch.compile(vm.forward, dynamic=True)
+        vm._la_vision_compiled = True
